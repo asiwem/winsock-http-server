@@ -69,6 +69,14 @@ static unsigned long long timestamp_ns()
 }
 */
 
+static int bad_request(response_container &res)
+{
+	res.responsebody = "The request is malformed";
+	res.response.append("HTTP/1.1 400 Bad Request\r\n");
+	res.response.append("Content-Type: text/plain\r\n");
+	return -1;
+}
+
 /* 1 means OK, 0 means no match and -1 is match but internal error */
 static constexpr int (*endpoints[])(const char *, request_container &, response_container &) = {
 	// GET /template
@@ -81,19 +89,14 @@ static constexpr int (*endpoints[])(const char *, request_container &, response_
 		http::dynamic_url_string key, val;
 		if (p("?")) {
 			do {
-				while (p(&key, "=", &val)) {
-					mappings.insert({ std::string{key.view}, std::string{val.view} });
-					std::cout << key.view << "=" << val.view << "\n";
-				}
+				if (!p(&key, "=", &val))
+					return bad_request(res);
+				mappings.insert({ std::string{key.view}, std::string{val.view} });
 			} while (p("&"));
 		}
 
-		if (!p(parser::term{})) {
-			res.responsebody = "The request is malformed";
-			res.response.append("HTTP/1.1 400 Malformed Request\r\n");
-			res.response.append("Content-Type: text/plain\r\n");
-			return -1;
-		}
+		if (!p(parser::term{}))
+			return bad_request(res);
 
 		std::ifstream file{ "template.html" };
 		std::string content{ std::istreambuf_iterator<char>{file}, std::istreambuf_iterator<char>{} };
