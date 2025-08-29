@@ -131,7 +131,7 @@ static constexpr int (*endpoints[])(const char *, request_container &, response_
 
 	// GET /
 	[](const char *s, request_container &req, response_container &res) -> int {
-		if ("GET" != req.method.view)
+		if (req.method.view != "GET")
 			return 0;
 
 		parser p{s};
@@ -172,11 +172,26 @@ static constexpr int (*endpoints[])(const char *, request_container &, response_
 			return bad_request(res, "The '/upload' endpoint must be used with the POST method");
 
 		res.responsebody.append("Your payload has a size of ").append(std::to_string(req.payload.size())).append(" bytes.\n");
-		res.responsebody.append("-- Copy of payload --\n");
-		res.responsebody.append(req.payload);
+		res.responsebody.append("-- Copy of payload (hex) --\n");
+
+		std::string_view seperator{ "" };
+		size_t payload_bytes_appended = 0;
+		char buf[3] = {};
+		for (auto c : req.payload) {
+			sprintf_s(buf, "%02X", (unsigned char) c);
+			res.responsebody.append(seperator).append(buf);
+			payload_bytes_appended++;
+			if ((payload_bytes_appended % 16) == 0) {
+				res.responsebody.append("\n");
+				seperator = "";
+			} else {
+				seperator = " ";
+			}
+		}
+		// res.responsebody.append(req.payload);
 
 		res.response.append("HTTP/1.1 200 OK\r\n");
-		res.response.append("Content-Type: text/html\r\n");
+		res.response.append("Content-Type: text/plain\r\n");
 		return 1;
 	},
 
@@ -200,7 +215,7 @@ static bool handle_request(SOCKET clientfd)
 	size_t rx = 0;
 
 	for (;;) {
-		const auto recv_result = recv(clientfd, recv_buf + rx, sizeof(recv_buf) - rx, 0);
+		const auto recv_result = recv(clientfd, recv_buf + rx, (int) sizeof(recv_buf) - rx, 0);
 		if (recv_result == 0) {
 			std::cout << "Client disconnected\n";
 			return false;
@@ -296,6 +311,9 @@ static bool handle_request(SOCKET clientfd)
 			has_payload = true;
 		}
 
+		if (req.method.view == "GET" && has_payload)
+			std::cout << "A GET request with a payload is unusual, but technically allowed.\n";
+
 		if ((content_length + request_head_size) > sizeof(recv_buf)) {
 			std::cerr << "This request exceeds the recv buffer size\n";
 			return false;
@@ -336,9 +354,9 @@ static bool handle_request(SOCKET clientfd)
 		res.response.append("\r\n");
 		res.response.append(res.responsebody);
 
-		int tx = 0;
+		size_t tx = 0;
 		for (;;) {
-			const auto send_result = send(clientfd, res.response.c_str()+tx, (int) res.response.size()-tx, 0);
+			const auto send_result = send(clientfd, res.response.c_str()+tx,  res.response.size()-tx, 0);
 			if (send_result == SOCKET_ERROR) {
 				std::cerr << "Accept failed with error " << WSAGetLastError() << "\n";
 				return false;
