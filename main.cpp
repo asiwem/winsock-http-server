@@ -14,9 +14,10 @@
 #pragma comment(lib, "Ws2_32.lib")
 
 struct request_container {
-	http::method		request_method;
-	parser::ascii_word	request_destination;
-	http::protocol		request_protocol;
+	http::method		method;
+	parser::ascii_word	target;
+	http::protocol		protocol;
+	std::string_view	payload;
 
 	std::unordered_map<std::string, std::string> headers;
 };
@@ -69,18 +70,34 @@ static unsigned long long timestamp_ns()
 }
 */
 
-static int bad_request(response_container &res)
+static int bad_request(response_container &res, std::string_view hint)
 {
-	res.responsebody = "The request is malformed";
+	res.responsebody.clear();
+	res.response.clear();
+
 	res.response.append("HTTP/1.1 400 Bad Request\r\n");
 	res.response.append("Content-Type: text/plain\r\n");
+	res.responsebody.append("The request is malformed: ").append(hint);
+	return -1;
+}
+
+static int internal_server_error(response_container &res, std::string_view hint)
+{
+	res.response.clear();
+	res.responsebody.clear();
+
+	res.response.append("HTTP/1.1 500 Internal Server Error\r\n");
+	res.response.append("Content-Type: text/plain\r\n");
+	res.responsebody.append("Internal server error: ").append(hint);
 	return -1;
 }
 
 /* 1 means OK, 0 means no match and -1 is match but internal error */
 static constexpr int (*endpoints[])(const char *, request_container &, response_container &) = {
-	// GET /template
 	[](const char *s, request_container &req, response_container &res) -> int {
+		if ("GET" != req.method.view)
+			return 0;
+
 		parser p{ s };
 		if (!p("/template"))
 			return 0;
@@ -90,16 +107,19 @@ static constexpr int (*endpoints[])(const char *, request_container &, response_
 		if (p("?")) {
 			do {
 				if (!p(&key, "=", &val))
-					return bad_request(res);
+					return bad_request(res,"The query parameters are malformed");
+
 				mappings.insert({ std::string{key.view}, std::string{val.view} });
 			} while (p("&"));
 		}
 
 		if (!p(parser::term{}))
-			return bad_request(res);
+			return bad_request(res, "The query parameters are malformed");
 
 		std::ifstream file{ "template.html" };
 		std::string content{ std::istreambuf_iterator<char>{file}, std::istreambuf_iterator<char>{} };
+		if (content.empty())
+			return internal_server_error(res, "No bytes in file 'template.html'");
 		
 		res.responsebody.append(create_replaced_string(content, mappings));
 
@@ -111,12 +131,17 @@ static constexpr int (*endpoints[])(const char *, request_container &, response_
 
 	// GET /
 	[](const char *s, request_container &req, response_container &res) -> int {
+		if ("GET" != req.method.view)
+			return 0;
+
 		parser p{s};
 		if (!p("/", parser::term{}))
 			return 0;
 
 		std::ifstream file("index.html");
 		std::string content{ std::istreambuf_iterator<char>{file}, std::istreambuf_iterator<char>{} };
+		if (content.empty())
+			return internal_server_error(res, "No bytes in file 'index.html'");
 
 		std::string headertable;
 		headertable.append("<table>\n");
@@ -127,9 +152,9 @@ static constexpr int (*endpoints[])(const char *, request_container &, response_
 
 		std::unordered_map<std::string, std::string> replacements = {
 			{"headertable",		headertable},
-			{"method",			std::string{ req.request_method.view }},
-			{"destination",		std::string{ req.request_destination.view }},
-			{"protocol",		std::string{ req.request_protocol.view}}
+			{"method",			std::string{ req.method.view }},
+			{"target",			std::string{ req.target.view }},
+			{"protocol",		std::string{ req.protocol.view }}
 		};
 		res.responsebody.append(create_replaced_string(content, replacements));
 
@@ -138,9 +163,30 @@ static constexpr int (*endpoints[])(const char *, request_container &, response_
 		return 1;
 	},
 
+	// POST /upload
+	[](const char *s, request_container &req, response_container &res) -> int {
+		if (req.target.view != "/upload")
+			return 0;
+
+		if (req.method.view != "POST")
+			return bad_request(res, "The '/upload' endpoint must be used with the POST method");
+
+		res.responsebody.append("Your payload has a size of ").append(std::to_string(req.payload.size())).append(" bytes.\n");
+		res.responsebody.append("-- Copy of payload --\n");
+		res.responsebody.append(req.payload);
+
+		res.response.append("HTTP/1.1 200 OK\r\n");
+		res.response.append("Content-Type: text/html\r\n");
+		return 1;
+	},
+
 	// This is the 404 Not Found handler
 	[](const char *s, request_container &req, response_container &res) -> int {
-		res.responsebody.append("The requested endpoint '").append(s).append("' could not be found.");
+		res.responsebody.append("The requested endpoint '")
+			.append(s)
+			.append("' with method '")
+			.append(req.method.view)
+			.append("' could not be found.");
 
 		res.response.append("HTTP/1.1 404 Not Found\r\n");
 		res.response.append("Content-Type: text/plain\r\n");
@@ -150,8 +196,8 @@ static constexpr int (*endpoints[])(const char *, request_container &, response_
 
 static bool handle_request(SOCKET clientfd)
 {
-	char recv_buf[2048] = {};
-	int rx = 0;
+	char recv_buf[4096] = {};
+	size_t rx = 0;
 
 	for (;;) {
 		const auto recv_result = recv(clientfd, recv_buf + rx, sizeof(recv_buf) - rx, 0);
@@ -208,11 +254,11 @@ static bool handle_request(SOCKET clientfd)
 			return std::string_view{ p.s, chars_remaining_in_line };
 		};
 
-		if (!p(&req.request_method,
+		if (!p(&req.method,
 			parser::whitespace{},
-			&req.request_destination,
+			&req.target,
 			parser::whitespace{},
-			&req.request_protocol,
+			&req.protocol,
 			"\r\n"))
 		{
 			std::cerr << "Parser error -- " << p.lasterror << " at: " << get_remaining_chars_of_current_parser_line() << "...\n";
@@ -236,13 +282,43 @@ static bool handle_request(SOCKET clientfd)
 			return false;
 		}
 
-		if ((p.s - recv_buf) != rx) {
-			std::cerr << "Payloads are not supported yet\n";
-			std::cerr << get_remaining_chars_of_current_parser_line() << "\n";
+		const auto request_head_size = p.s - recv_buf;
+		size_t content_length = 0;
+		bool has_payload = false;
+		const auto lookup_content_length = req.headers.find("Content-Length");
+		if (lookup_content_length != req.headers.end()) {
+			parser clp{ lookup_content_length->second.c_str() };
+			if (!clp(&content_length, parser::term{})) {
+				std::cerr << "The Content-Length header is malformed\n";
+				return false;
+			}
+
+			has_payload = true;
+		}
+
+		if ((content_length + request_head_size) > sizeof(recv_buf)) {
+			std::cerr << "This request exceeds the recv buffer size\n";
 			return false;
 		}
 
-		std::string dest_as_string{ req.request_destination.view };
+		const auto lookup_transfer_encoding = req.headers.find("Transfer-Encoding");
+		if (lookup_transfer_encoding != req.headers.end()) {
+			std::cerr << "Transfer-Encoding is not supported yet\n";
+			return false;
+		}
+
+		if (rx > (request_head_size + content_length)) {
+			std::cerr << "Pipelining is not supported\n";
+			return false;
+		}
+
+		if (rx < (request_head_size + content_length))
+			continue;
+
+		req.payload = std::string_view{ recv_buf + request_head_size, rx - request_head_size };
+
+		std::cout << req.method.view << " " << req.target.view << "\n";
+		std::string dest_as_string{ req.target.view };
 		response_container res;
 		for (auto ep : endpoints) {
 			const auto matchresult = ep(dest_as_string.c_str(), req, res);
